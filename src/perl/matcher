@@ -3,12 +3,15 @@
 # Author: Tim Pope <rxvt-unicodeNOSPAM@tpope.org>
 #         Bob Farrell <robertanthonyfarrell@gmail.com>
 #         Emanuele Giaquinta
+#         Dimitrios Semitsoglou-Tsiapos <kmhzsem@gmx.com>
 
 #:META:RESOURCE:%.launcher:string:default launcher command
 #:META:RESOURCE:%.button:string:the mouse button used to activate a match
 #:META:RESOURCE:%.pattern.:string:extra pattern to match
 #:META:RESOURCE:%.launcher.:string:custom launcher for pattern
 #:META:RESOURCE:%.rend.:string:custom rendition for pattern
+#:META:RESOURCE:%.delim..left:string:left delimiter for pattern
+#:META:RESOURCE:%.delim..right:string:right delimiter for pattern
 
 =head1 NAME
 
@@ -29,6 +32,16 @@ The default pattern to match URLs can be overridden with the
 C<matcher.pattern.0> resource, and additional patterns can be specified
 with numbered patterns, in a manner similar to the "selection" extension.
 The launcher can also be overridden on a per-pattern basis.
+
+Additionally, matching within viewports drawn by curses-like applications is
+supported. By default tmux and weechat windows are detected, but you may
+override the regular expressions that identify the viewports' boundaries via
+the C<matcher.delim.n.left> and C<matcher.delim.n.right> resources, where n is
+a positive integer. The existence of C<matcher.delim.0.left> disables the
+built-in delimiters. The feature can be disabled by setting only
+C<matcher.delim.0.left>.delim.n.left>. Because there is no way to tell at which
+point a match ends if the following line contains text, the user needs to click
+on the line containing the last chunk of the match.
 
 It is possible to activate the most recently seen match or a list of matches
 from the keyboard.  Simply bind a keysym to "matcher:last" or
@@ -88,6 +101,18 @@ Example: use a custom configuration.
     URxvt.matcher.pattern.2:  \\B(/\\S+?):(\\d+)(?=:|$)
     URxvt.matcher.launcher.2: gvim +$2 $1
 
+    ! default delimiting regex pairs (use [] to avoid ending lines with " ")
+    URxvt.matcher.delim.0.left:  │
+    URxvt.matcher.delim.0.right: │
+    URxvt.matcher.delim.1.left:  ^
+    URxvt.matcher.delim.1.right: │
+    URxvt.matcher.delim.2.left:  │
+    URxvt.matcher.delim.2.right: $
+    URxvt.matcher.delim.3.left:  \\|[\\ ]
+    URxvt.matcher.delim.3.right: \\ │
+    URxvt.matcher.delim.4.left:  \\|[\\ ]
+    URxvt.matcher.delim.4.right: $
+
 =cut
 
 my $url =
@@ -100,6 +125,115 @@ my $url =
       )+
    }x;
 
+my @default_delims = (
+   # tmux
+   {left => '│', right => '│'},
+   {left => '^', right => '│'},
+   {left => '│', right => '$'},
+   # weechat
+   {left => '\ \|\ ', right => '\ │'},
+   {left => '\ \|\ ', right =>   '$'},
+);
+
+# Append spaces to allow correct calculations in case of \n before $ncol
+sub padded_line_t {
+   my ($self, $row) = @_;
+   my $line = $self->line($row);
+   my $line_t = $line->t;
+   return $line_t . (" " x ($self->{term}->ncol - length($line_t)));
+}
+
+# Prepend the previous chunk of a match and get coords for the entire match
+sub populate_prev {
+   my ($self, $frow, $box, $boxd, $pattern, $delims, $match, $row) = @_;
+
+   my $line_t = padded_line_t($self, $row);
+   my $line_td  = substr($line_t, $boxd->[0], $boxd->[1] - $boxd->[0]);
+   my @results;
+
+   my $partial_pattern =   # Given $line_td is:
+      qr{                  # ^│foo http://s '(http:/│$
+         ^$delims->{left}  #  ^
+         (?<pre>.*?)       #   |<--------->|
+         (?<match>\S+)     #                |<---->|
+         $delims->{right}$ #                        ^
+      }x;
+
+   if ($line_td =~ /$partial_pattern/g) {
+      # Keep $+{'pre'} so that the beginning offset don't need adjustment later
+      $match = $+{'pre'} . $+{'match'} . $match;
+      my $lp = length($+{'pre'});
+
+      if (! $+{'pre'}) {
+         push @results, populate_prev(@_[0 .. $#_ - 2], $match, $row - 1);
+      }
+
+      if ($match =~ /.{$lp}.*?($pattern)/x) {
+         use integer;
+
+         my $box_width = ($box->[1] - $box->[0]);
+         my $off = $-[1];
+         return @results if $off >= $box_width;       # $1 starts after $row
+
+         my $last_c = length($1) + $off;
+         my $lines = ($last_c - 1) / $box_width;
+         return @results if $lines + $row != $frow;   # $1 ends before $frow
+
+         my @coords = (
+            [$box->[0], $box->[0] + (($last_c - 1) % $box_width)], # last line
+            ([$box->[0], $box->[1] - 1]) x ($lines - 1),           # mid lines
+            [$box->[0] + $off, $box->[1] - 1],                     # first line
+         );
+         push @results, [$1, \@coords];
+      }
+   }
+   return @results;
+}
+
+# The reason why we don't use a single regex to find these delims (while
+# searching in `multiline_matches` for example) is because we need to grab all
+# possible combinations.
+sub delim_scopes {
+   my ($line_t, $pattern_delims) = @_;
+                                                      # Given both delims are
+   my @areas;                                         # "│" and $line_t is:
+   for my $delim (@{$pattern_delims}) {               #
+                                                      # │/schmorp.de/)' │examp│
+      while ($line_t =~ /$delim->{left}/g) {          # ^^
+         my ($left_b, $left_e) = ($-[0], $+[0]);      #
+         my $line_t_cont = substr($line_t, $left_e);  #  |<---$line_t_cont-----
+                                                      #
+         while ($line_t_cont =~ /$delim->{right}/g) { #                ^^    ^^
+            my @boxd = ($left_b, $left_e + $+[0]);    # |<-------@boxd->|---->|
+            my @box  = ($left_e, $left_e + $-[0]);    #  |<------@box-->|--->|
+            push @areas, [\@boxd, \@box, $delim];
+         }
+
+      }
+
+   }
+   return @areas;
+}
+
+# Fetch the match and coords of all multi-line matches ending on given row
+# By not filtering $row < 1 we can do matches that start out of screen
+sub multiline_matches {
+   my ($self, $row, $pattern) = @_;
+
+   my $line_t = $self->padded_line_t($row);
+   my @results;
+
+   for my $ds (delim_scopes($line_t, $self->{pattern_delims})) {
+      my ($boxd, $box, $delim) = @{$ds};
+      if (substr($line_t, $box->[0]) =~ /^\S+/) {
+         push @results, map {match => $_->[0], coords => $_->[1]},
+         $self->populate_prev($row, $box, $boxd, $pattern, $delim, $&, $row-1);
+      }
+   }
+
+   return @results;
+}
+
 sub matchlist_key_press {
    my ($self, $event, $keysym, $octets) = @_;
 
@@ -109,7 +243,7 @@ sub matchlist_key_press {
    my $i = ($keysym == 96 ? 0 : $keysym - 48);
    if ($i >= 0 && $i < @{ $self->{matches} }) {
       my @exec = @{ $self->{matches}[$i] };
-      $self->exec_async (@exec[5 .. $#exec]);
+      $self->exec_async (@exec[2 .. $#exec]);
    }
 
    1
@@ -170,7 +304,7 @@ sub matchlist {
 
    my $i = 0;
    for my $match (@{ $self->{matches} }) {
-      my $text = $match->[4];
+      my $text = $match->[1];
       my $w = $self->strwidth ("$i-$text");
 
       $width = $w if $w > $width;
@@ -182,7 +316,7 @@ sub matchlist {
    $self->{overlay} = $self->overlay (0, 0, $width, scalar (@{ $self->{matches} }), urxvt::OVERLAY_RSTYLE, 2);
    my $i = 0;
    for my $match (@{ $self->{matches} }) {
-      my $text = $match->[4];
+      my $text = $match->[1];
 
       $self->{overlay}->set (0, $i, "$i-$text");
       $i++;
@@ -263,6 +397,24 @@ sub on_start {
    }
    $self->{matchers} = \@matchers;
 
+   my $idx = 0;
+   if (!defined($self->my_resource ("delim.$idx.left"))) {
+      $self->{pattern_delims} = \@default_delims;
+   } else {
+      my @pattern_delims;
+      for (; defined (my $delim_left = $self->my_resource ("delim.$idx.left")); $idx++) {
+         my $delim_right = $self->my_resource ("delim.$idx.right");
+         if (!defined($delim_right)) {
+            warn("delim.$idx.left has no matching delim.$idx.right resource. Skipping\n");
+            continue;
+         }
+         $delim_left = $self->locale_decode ($delim_left);
+         $delim_right = $self->locale_decode ($delim_right);
+         unshift @pattern_delims, { left => $delim_left, right => $delim_right };
+      }
+      $self->{pattern_delims} = \@pattern_delims;
+   }
+
    ()
 }
 
@@ -277,7 +429,6 @@ sub on_line_update {
    # find all urls (if any)
    for my $matcher (@{$self->{matchers}}) {
       while ($text =~ /$matcher->[0]/g) {
-         #print "$&\n";
          $rend ||= $line->r;
 
          # mark all characters as underlined. we _must_ not toggle underline,
@@ -288,6 +439,24 @@ sub on_line_update {
    }
 
    $line->r ($rend) if $rend;
+
+   for my $matcher (@{$self->{matchers}}) {
+      for my $result ($self->multiline_matches($row, $matcher->[0])) {
+         my @coords = @{$result->{coords}};
+
+         for my $i (0 .. $#coords) {
+            my $linex = $self->line($row - $i);
+            my $rendx = $linex->r;
+
+            $rendx ||= $linex->r;
+            &{$matcher->[2]}
+               for (@{$rendx}[$coords[$i][0] .. $coords[$i][1]]);
+
+            $linex->r($rendx);
+         }
+
+      }
+   }
 
    ()
 }
@@ -326,8 +495,26 @@ sub find_matches {
                   /egx; $_ } split /\s+/, $launcher;
             }
 
-            push @matches, [ $line->coord_of ($begin[0]), $line->coord_of ($end[0]), $match, @exec ];
+            my @spans = [($line->coord_of ($begin[0]), $line->coord_of ($end[0]))];
+            push @matches, [ \@spans, $match, @exec ];
          }
+      }
+   }
+
+   for my $matcher (@{$self->{matchers}}) {
+      my $launcher = $matcher->[1] || $self->{launcher};
+      for my $result ($self->multiline_matches($row, $matcher->[0])) {
+         my @coords = @{$result->{coords}};
+         my $match = $result->{match};
+         my @exec = $launcher !~ /\$/ ? ($launcher, $match) : undef;
+
+         next if (defined($col) &&
+            !(@coords[0]->[0] <= $col && @coords[0]->[1] >= $col));
+
+         my @spans = map [ $row - $_, $coords[$_]->[0],
+                           $row - $_, $coords[$_]->[1] + 1 ], 0 .. $#coords;
+
+         push @matches, [ \@spans, $match, @exec ];
       }
    }
 
@@ -340,7 +527,7 @@ sub command_for {
    my @matches = $self->find_matches ($row, $col);
    if (@matches) {
       my @match = @{ $matches[0] };
-      return @match[5 .. $#match];
+      return @match[2 .. $#match];
    }
 
    ()
@@ -443,8 +630,14 @@ sub select_refresh {
 
    return unless $self->{matches};
 
-   my $cur = $self->{matches}[$self->{id}];
-   $self->scr_xor_span (@$cur[0 .. 3], urxvt::RS_RVid);
+   my $cur = $self->{matches}[$self->{id}][0];
+
+   for my $span (@$cur) {
+      my ($first_row, $first_col, $end_row, $end_col) = @$span;
+      for my $row ($first_row .. $end_row) {
+         $self->scr_xor_span ($first_row, $first_col, $end_row, $end_col, urxvt::RS_RVid);
+      }
+   }
 
    ()
 }
@@ -455,12 +648,12 @@ sub select_key_press {
    if ($keysym == 0xff0d || $keysym == 0xff8d) { # enter
       if ($self->{matches}) {
          my @match = @{ $self->{matches}[$self->{id}] };
-         $self->exec_async (@match[5 .. $#match]);
+         $self->exec_async (@match[2 .. $#match]);
       }
       $self->select_leave;
    } elsif ($keysym == 0x79) { # y
       if ($self->{matches}) {
-         $self->selection ($self->{matches}[$self->{id}][4], 1);
+         $self->selection ($self->{matches}[$self->{id}][1], 1);
          $self->selection_grab (urxvt::CurrentTime, 1);
       }
       $self->select_leave;
