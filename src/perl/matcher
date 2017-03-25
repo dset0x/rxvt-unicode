@@ -10,8 +10,10 @@
 #:META:RESOURCE:%.pattern.:string:extra pattern to match
 #:META:RESOURCE:%.launcher.:string:custom launcher for pattern
 #:META:RESOURCE:%.rend.:string:custom rendition for pattern
-#:META:RESOURCE:%.delim..left:string:left delimiter for pattern
-#:META:RESOURCE:%.delim..right:string:right delimiter for pattern
+#:META:RESOURCE:%.multiline:boolean:toggle matcher for curses-like applications
+#:META:RESOURCE:%.multiline.builtin:boolean:toggle use of builtin delimiters
+#:META:RESOURCE:%.multiline.delim..left:string:left delimiting regex
+#:META:RESOURCE:%.multiline.delim..right:string:right delimiting regex
 
 =head1 NAME
 
@@ -33,15 +35,16 @@ C<matcher.pattern.0> resource, and additional patterns can be specified
 with numbered patterns, in a manner similar to the "selection" extension.
 The launcher can also be overridden on a per-pattern basis.
 
-Additionally, matching within viewports drawn by curses-like applications is
-supported. By default tmux and weechat windows are detected, but you may
-override the regular expressions that identify the viewports' boundaries via
-the C<matcher.delim.n.left> and C<matcher.delim.n.right> resources, where n is
-a positive integer. The existence of C<matcher.delim.0.left> disables the
-built-in delimiters. The feature can be disabled by setting only
-C<matcher.delim.0.left>.delim.n.left>. Because there is no way to tell at which
-point a match ends if the following line contains text, the user needs to click
-on the line containing the last chunk of the match.
+Additionally, matching within viewports drawn by curses-like applications can
+be enabled by setting  C<matcher.multiline> to C<true>. By default, tmux, mutt
+and weechat windows are detected, but you may append to the regular expressions
+that identify the viewports' boundaries via the
+C<matcher.multiline.delim.n.left> and C<matcher.multiline.delim.n.right>
+resources, where n is a positive integer. To disable the built-in delimiters
+(see @default_delims), you may set C<matcher.multiline.builtin> to C<false>.
+Important: Because there is no way to tell at which point a match ends if the
+beginning of following line contains text, the user must click on the line
+containing the last chunk of the desired match.
 
 It is possible to activate the most recently seen match or a list of matches
 from the keyboard.  Simply bind a keysym to "matcher:last" or
@@ -101,17 +104,14 @@ Example: use a custom configuration.
     URxvt.matcher.pattern.2:  \\B(/\\S+?):(\\d+)(?=:|$)
     URxvt.matcher.launcher.2: gvim +$2 $1
 
-    ! default delimiting regex pairs (use [] to avoid ending lines with " ")
-    URxvt.matcher.delim.0.left:  │
-    URxvt.matcher.delim.0.right: │
-    URxvt.matcher.delim.1.left:  ^
-    URxvt.matcher.delim.1.right: │
-    URxvt.matcher.delim.2.left:  │
-    URxvt.matcher.delim.2.right: $
-    URxvt.matcher.delim.3.left:  \\|[\\ ]
-    URxvt.matcher.delim.3.right: \\ │
-    URxvt.matcher.delim.4.left:  \\|[\\ ]
-    URxvt.matcher.delim.4.right: $
+    ! enable multiline matching and add custom delimiter regexes
+    ! tip: use [\\ ] to avoid ending lines with " " if your editor strips them
+    URxvt.matcher.multiline:                 true
+    URxvt.matcher.multiline.builtin:         true
+    URxvt.matcher.multiline.delim.0.left:     <
+    URxvt.matcher.multiline.delim.0.right:    >
+    URxvt.matcher.multiline.delim.1.left:     \(
+    URxvt.matcher.multiline.delim.1.right:    \)
 
 =cut
 
@@ -126,7 +126,7 @@ my $url =
    }x;
 
 my @default_delims = (
-   # tmux
+   # tmux / mutt
    {left => '│', right => '│'},
    {left => '^', right => '│'},
    {left => '│', right => '$'},
@@ -346,6 +346,10 @@ sub my_resource {
    $_[0]->x_resource ("%.$_[1]")
 }
 
+sub my_resource_boolean {
+   $_[0]->x_resource_boolean ("%.$_[1]")
+}
+
 # turn a rendition spec in the resource into a sub that implements it on $_
 sub parse_rend {
    my ($self, $str) = @_;
@@ -397,22 +401,24 @@ sub on_start {
    }
    $self->{matchers} = \@matchers;
 
-   my $idx = 0;
-   if (!defined($self->my_resource ("delim.$idx.left"))) {
-      $self->{pattern_delims} = \@default_delims;
-   } else {
-      my @pattern_delims;
-      for (; defined (my $delim_left = $self->my_resource ("delim.$idx.left")); $idx++) {
-         my $delim_right = $self->my_resource ("delim.$idx.right");
+   my $multiline = $self->my_resource_boolean ("multiline");
+   my $builtin = $self->my_resource_boolean ("multiline.builtin");
+   if ($multiline) {
+      if ($builtin eq '' || $builtin) {
+         $self->{pattern_delims} = \@default_delims;
+      }
+      my @user_delims;
+      for (my $idx = 0; defined (my $delim_left = $self->my_resource ("multiline.delim.$idx.left")); $idx++) {
+         my $delim_right = $self->my_resource ("multiline.delim.$idx.right");
          if (!defined($delim_right)) {
-            warn("delim.$idx.left has no matching delim.$idx.right resource. Skipping\n");
+            warn("multiline.delim.$idx.left has no matching delim.$idx.right resource. Skipping\n");
             continue;
          }
          $delim_left = $self->locale_decode ($delim_left);
          $delim_right = $self->locale_decode ($delim_right);
-         unshift @pattern_delims, { left => $delim_left, right => $delim_right };
+         unshift @user_delims, { left => $delim_left, right => $delim_right };
       }
-      $self->{pattern_delims} = \@pattern_delims;
+      push @{$self->{pattern_delims}}, @user_delims;
    }
 
    ()
