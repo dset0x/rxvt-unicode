@@ -12,6 +12,7 @@
 #:META:RESOURCE:%.rend.:string:custom rendition for pattern
 #:META:RESOURCE:%.multiline:boolean:toggle matcher for curses-like applications
 #:META:RESOURCE:%.multiline.builtin:boolean:toggle use of builtin delimiters
+#:META:RESOURCE:%.multiline.maxMatchLength:string:max url length to look for (default: 1500)
 #:META:RESOURCE:%.multiline.delim..left:string:left delimiting regex
 #:META:RESOURCE:%.multiline.delim..right:string:right delimiting regex
 
@@ -133,6 +134,8 @@ my @default_delims = (
    # weechat
    {left => '\ \|\ ', right => '\ │'},
    {left => '\ \|\ ', right =>   '$'},
+   # emacs (optionally within tmux)
+   {left => '(^|│)', right => '\\\\|\\ ($|│)'},
 );
 
 # Append spaces to allow correct calculations in case of \n before $ncol
@@ -145,46 +148,37 @@ sub padded_line_t {
 
 # Prepend the previous chunk of a match and get coords for the entire match
 sub populate_prev {
-   my ($self, $frow, $box, $boxd, $pattern, $delims, $match, $row) = @_;
+   my ($self, $frow, $box, $boxd, $pattern, $delims, $text, $row) = @_;
 
    my $line_t = padded_line_t($self, $row);
    my $line_td  = substr($line_t, $boxd->[0], $boxd->[1] - $boxd->[0]);
+   my $box_width = ($box->[1] - $box->[0]);
    my @results;
 
-   my $partial_pattern =   # Given $line_td is:
-      qr{                  # ^│foo http://s '(http:/│$
-         ^$delims->{left}  #  ^
-         (?<pre>.*?)       #   |<--------->|
-         (?<match>\S+)     #                |<---->|
-         $delims->{right}$ #                        ^
-      }x;
+   my $max_len = $self->{multiline_max_match_length};
+   return @results if ($frow - $row) > ($max_len / ($box_width + 1));
 
-   if ($line_td =~ /$partial_pattern/g) {
-      # Keep $+{'pre'} so that the beginning offset don't need adjustment later
-      $match = $+{'pre'} . $+{'match'} . $match;
-      my $lp = length($+{'pre'});
+   if ($line_td =~ /^$delims->{left}(?<text>.{$box_width})$delims->{right}$/g) {
+      $text = $+{'text'} . $text;
+      push @results, populate_prev(@_[0 .. $#_ - 2], $text, $row - 1);
 
-      if (! $+{'pre'}) {
-         push @results, populate_prev(@_[0 .. $#_ - 2], $match, $row - 1);
-      }
-
-      if ($match =~ /.{$lp}.*?($pattern)/x) {
+      while ($text =~ /$pattern/g) {
          use integer;
+         my $match = $&;
+         my $off = $-[0];
 
-         my $box_width = ($box->[1] - $box->[0]);
-         my $off = $-[1];
-         return @results if $off >= $box_width;       # $1 starts after $row
+         next if $off >= $box_width;       # $match starts after $row
 
-         my $last_c = length($1) + $off;
+         my $last_c = length($match) + $off;
          my $lines = ($last_c - 1) / $box_width;
-         return @results if $lines + $row != $frow;   # $1 ends before $frow
+         next if $lines + $row != $frow;   # $match ends before $frow
 
          my @coords = (
             [$box->[0], $box->[0] + (($last_c - 1) % $box_width)], # last line
             ([$box->[0], $box->[1] - 1]) x ($lines - 1),           # mid lines
             [$box->[0] + $off, $box->[1] - 1],                     # first line
          );
-         push @results, [$1, \@coords];
+         push @results, [$match, \@coords];
       }
    }
    return @results;
@@ -225,10 +219,10 @@ sub multiline_matches {
 
    for my $ds (delim_scopes($line_t, $self->{pattern_delims})) {
       my ($boxd, $box, $delim) = @{$ds};
-      if (substr($line_t, $box->[0]) =~ /^\S+/) {
-         push @results, map {match => $_->[0], coords => $_->[1]},
-         $self->populate_prev($row, $box, $boxd, $pattern, $delim, $&, $row-1);
-      }
+      my $text  = substr($line_t, $box->[0], $box->[1] - $box->[0]);
+
+      push @results, map {match => $_->[0], coords => $_->[1]},
+      $self->populate_prev($row, $box, $boxd, $pattern, $delim, $text, $row-1);
    }
 
    return @results;
@@ -420,6 +414,7 @@ sub on_start {
       }
       push @{$self->{pattern_delims}}, @user_delims;
    }
+   $self->{multiline_max_match_length} = $self->my_resource("multiline.maxMatchLength") + 0 || 1500;
 
    ()
 }
