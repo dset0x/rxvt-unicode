@@ -128,14 +128,17 @@ my $url =
 
 my @default_delims = (
    # tmux / mutt
-   {left => '│', right => '│'},
-   {left => '^', right => '│'},
-   {left => '│', right => '$'},
+   {left => '│', right => '│', right_last => '│'},
+   {left => '^', right => '│', right_last => '│'},
+   {left => '│', right => '$', right_last => '$'},
    # weechat
-   {left => '\ \|\ ', right => '\ │'},
-   {left => '\ \|\ ', right =>   '$'},
+   {left => '\ \|\ ', right => '\ │', right_last => '\ │'},
+   {left => '\ \|\ ', right =>   '$', right_last =>   '$'},
    # emacs (optionally within tmux)
-   {left => '(^|│)', right => '\\\\|\\ ($|│)'},
+   {left => '^', right => '\\\\$', right_last => '\\ $'},
+   {left => '^', right => '\\\\│', right_last => '\\ │'},
+   {left => '│', right => '\\\\│', right_last => '\\ │'},
+   {left => '│', right => '\\\\$', right_last => '\\ $'},
 );
 
 # Append spaces to allow correct calculations in case of \n before $ncol
@@ -197,7 +200,7 @@ sub delim_scopes {
          my ($left_b, $left_e) = ($-[0], $+[0]);      #
          my $line_t_cont = substr($line_t, $left_e);  #  |<---$line_t_cont-----
                                                       #
-         while ($line_t_cont =~ /$delim->{right}/g) { #                ^^    ^^
+         while ($line_t_cont =~ /$delim->{right_last}/g) { #                ^^    ^^
             my @boxd = ($left_b, $left_e + $+[0]);    # |<-------@boxd->|---->|
             my @box  = ($left_e, $left_e + $-[0]);    #  |<------@box-->|--->|
             push @areas, [\@boxd, \@box, $delim];
@@ -395,26 +398,31 @@ sub on_start {
    }
    $self->{matchers} = \@matchers;
 
-   my $multiline = $self->my_resource_boolean ("multiline");
-   my $builtin = $self->my_resource_boolean ("multiline.builtin");
-   if ($multiline) {
+   if ($self->my_resource_boolean ("multiline")) {
+
+      my $builtin = $self->my_resource_boolean ("multiline.builtin");
       if ($builtin eq '' || $builtin) {
          $self->{pattern_delims} = \@default_delims;
       }
-      my @user_delims;
-      for (my $idx = 0; defined (my $delim_left = $self->my_resource ("multiline.delim.$idx.left")); $idx++) {
-         my $delim_right = $self->my_resource ("multiline.delim.$idx.right");
-         if (!defined($delim_right)) {
+
+      for (my $idx = 0; my $left = $self->my_resource("multiline.delim.$idx.left"); $idx++) {
+         my $right = $self->my_resource("multiline.delim.$idx.right");
+         my $right_last = $self->my_resource("multiline.delim.$idx.right_last") || $right;
+
+         if (!defined($right)) {
             warn("multiline.delim.$idx.left has no matching delim.$idx.right resource. Skipping\n");
-            continue;
+            next;
          }
-         $delim_left = $self->locale_decode ($delim_left);
-         $delim_right = $self->locale_decode ($delim_right);
-         unshift @user_delims, { left => $delim_left, right => $delim_right };
+
+         push @{$self->{pattern_delims}}, {
+            left => $self->locale_decode($left),
+            right => $self->locale_decode($right),
+            right_last => $self->locale_decode($right_last)
+         };
       }
-      push @{$self->{pattern_delims}}, @user_delims;
+
+      $self->{multiline_max_match_length} = $self->my_resource("multiline.maxMatchLength") + 0 || 1500;
    }
-   $self->{multiline_max_match_length} = $self->my_resource("multiline.maxMatchLength") + 0 || 1500;
 
    ()
 }
