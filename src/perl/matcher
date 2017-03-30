@@ -12,7 +12,6 @@
 #:META:RESOURCE:%.rend.:string:custom rendition for pattern
 #:META:RESOURCE:%.multiline:boolean:toggle matcher for curses-like applications
 #:META:RESOURCE:%.multiline.builtin:boolean:toggle use of builtin delimiters
-#:META:RESOURCE:%.multiline.maxMatchLength:string:max url length to look for (default: 1500)
 #:META:RESOURCE:%.multiline.delim..left:string:left delimiting regex
 #:META:RESOURCE:%.multiline.delim..right:string:right delimiting regex
 
@@ -108,11 +107,8 @@ Example: use a custom configuration.
     ! enable multiline matching and add custom delimiter regexes
     ! tip: use [\\ ] to avoid ending lines with " " if your editor strips them
     URxvt.matcher.multiline:                 true
-    URxvt.matcher.multiline.builtin:         true
     URxvt.matcher.multiline.delim.0.left:     <
     URxvt.matcher.multiline.delim.0.right:    >
-    URxvt.matcher.multiline.delim.1.left:     \(
-    URxvt.matcher.multiline.delim.1.right:    \)
 
 =cut
 
@@ -151,39 +147,47 @@ sub padded_line_t {
 
 # Prepend the previous chunk of a match and get coords for the entire match
 sub populate_prev {
-   my ($self, $frow, $box, $boxd, $pattern, $delims, $text, $row) = @_;
+   my ($self, $frow, $box, $boxd, $pattern, $delims, $shortest_only, $text, $row) = @_;
+   use integer;
+
+   my @results;
+   my $box_width = ($box->[1] - $box->[0]);
 
    my $line_t = padded_line_t($self, $row);
    my $line_td  = substr($line_t, $boxd->[0], $boxd->[1] - $boxd->[0]);
-   my $box_width = ($box->[1] - $box->[0]);
-   my @results;
 
-   my $max_len = $self->{multiline_max_match_length};
-   return @results if ($frow - $row) > ($max_len / ($box_width + 1));
-
-   if ($line_td =~ /^$delims->{left}(?<text>.{$box_width})$delims->{right}$/g) {
+   my $finished = 0;
+   my $bw1 = $box_width - 1;
+   if ($line_td =~ /^$delims->{left}(?<text>.{$bw1}\S)$delims->{right}$/) {
       $text = $+{'text'} . $text;
-      push @results, populate_prev(@_[0 .. $#_ - 2], $text, $row - 1);
+      if ($shortest_only && $text =~ /$pattern/) {
+         $finished = 1;
+      } else {
+         push @results, populate_prev(@_[0 .. $#_ - 2], $text, $row - 1);
+      }
+   }
 
+   if (!$shortest_only || $finished) {
       while ($text =~ /$pattern/g) {
-         use integer;
          my $match = $&;
          my $off = $-[0];
 
-         next if $off >= $box_width;       # $match starts after $row
+         next if $off > $box_width;                # $match starts after $row
 
          my $last_c = length($match) + $off;
          my $lines = ($last_c - 1) / $box_width;
-         next if $lines + $row != $frow;   # $match ends before $frow
+         next if $lines + $row != $frow;           # $match ends before $frow
 
          my @coords = (
             [$box->[0], $box->[0] + (($last_c - 1) % $box_width)], # last line
             ([$box->[0], $box->[1] - 1]) x ($lines - 1),           # mid lines
             [$box->[0] + $off, $box->[1] - 1],                     # first line
          );
-         push @results, [$match, \@coords];
+         push @results, {match => $match, coords => \@coords};
       }
+
    }
+
    return @results;
 }
 
@@ -192,17 +196,17 @@ sub populate_prev {
 # possible combinations.
 sub delim_scopes {
    my ($line_t, $pattern_delims) = @_;
-                                                      # Given both delims are
-   my @areas;                                         # "│" and $line_t is:
-   for my $delim (@{$pattern_delims}) {               #
-                                                      # │/schmorp.de/)' │examp│
-      while ($line_t =~ /$delim->{left}/g) {          # ^^
-         my ($left_b, $left_e) = ($-[0], $+[0]);      #
-         my $line_t_cont = substr($line_t, $left_e);  #  |<---$line_t_cont-----
-                                                      #
-         while ($line_t_cont =~ /$delim->{right_last}/g) { #                ^^    ^^
-            my @boxd = ($left_b, $left_e + $+[0]);    # |<-------@boxd->|---->|
-            my @box  = ($left_e, $left_e + $-[0]);    #  |<------@box-->|--->|
+                                                            # Given both delims are
+   my @areas;                                               # "│" and $line_t is:
+   for my $delim (@{$pattern_delims}) {                     #
+                                                            # │/schmorp.de/)' │examp│
+      while ($line_t =~ /$delim->{left}(?=\S)/g) {          # ^^
+         my ($left_b, $left_e) = ($-[0], $+[0]);            #
+         my $line_t_cont = substr($line_t, $left_e);        #  |<---$line_t_cont-----
+                                                            #
+         while ($line_t_cont =~ /$delim->{right_last}/g) {  #                ^^    ^^
+            my @boxd = ($left_b, $left_e + $+[0]);          # |<-------@boxd->|---->|
+            my @box  = ($left_e, $left_e + $-[0]);          #  |<------@box-->|--->|
             push @areas, [\@boxd, \@box, $delim];
          }
 
@@ -215,7 +219,7 @@ sub delim_scopes {
 # Fetch the match and coords of all multi-line matches ending on given row
 # By not filtering $row < 1 we can do matches that start out of screen
 sub multiline_matches {
-   my ($self, $row, $pattern) = @_;
+   my ($self, $row, $pattern, $shortest_only) = @_;
 
    my $line_t = $self->padded_line_t($row);
    my @results;
@@ -223,9 +227,8 @@ sub multiline_matches {
    for my $ds (delim_scopes($line_t, $self->{pattern_delims})) {
       my ($boxd, $box, $delim) = @{$ds};
       my $text  = substr($line_t, $box->[0], $box->[1] - $box->[0]);
-
-      push @results, map {match => $_->[0], coords => $_->[1]},
-      $self->populate_prev($row, $box, $boxd, $pattern, $delim, $text, $row-1);
+      push @results,
+      $self->populate_prev($row, $box, $boxd, $pattern, $delim, $shortest_only, $text, $row-1);
    }
 
    return @results;
@@ -420,8 +423,6 @@ sub on_start {
             right_last => $self->locale_decode($right_last)
          };
       }
-
-      $self->{multiline_max_match_length} = $self->my_resource("multiline.maxMatchLength") + 0 || 1500;
    }
 
    ()
@@ -450,14 +451,13 @@ sub on_line_update {
    $line->r ($rend) if $rend;
 
    for my $matcher (@{$self->{matchers}}) {
-      for my $result ($self->multiline_matches($row, $matcher->[0])) {
+      for my $result ($self->multiline_matches($row, $matcher->[0], 1)) {
          my @coords = @{$result->{coords}};
 
          for my $i (0 .. $#coords) {
             my $linex = $self->line($row - $i);
             my $rendx = $linex->r;
 
-            $rendx ||= $linex->r;
             &{$matcher->[2]}
                for (@{$rendx}[$coords[$i][0] .. $coords[$i][1]]);
 
@@ -512,7 +512,7 @@ sub find_matches {
 
    for my $matcher (@{$self->{matchers}}) {
       my $launcher = $matcher->[1] || $self->{launcher};
-      for my $result ($self->multiline_matches($row, $matcher->[0])) {
+      for my $result ($self->multiline_matches($row, $matcher->[0], 0)) {
          my @coords = @{$result->{coords}};
          my $match = $result->{match};
          my @exec = $launcher !~ /\$/ ? ($launcher, $match) : undef;
